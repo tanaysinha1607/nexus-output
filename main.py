@@ -1,236 +1,151 @@
 import os
 import uuid
-import random
-import string
-from datetime import datetime, timezone, date
-from typing import Optional, List, Dict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends, status
-from fastapi.responses import RedirectResponse, JSONResponse
-from pydantic import BaseModel, Field, HttpUrl, validator
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from pydantic import BaseModel, Field, HttpUrl
 
 app = FastAPI()
 
 
-# ---------- In‑memory storage ----------
-api_keys_by_id: Dict[str, Dict] = {}
-api_keys_by_key: Dict[str, Dict] = {}
-
-links_by_id: Dict[str, Dict] = {}
-links_by_alias: Dict[str, Dict] = {}
-
-# ---------- Helper utilities ----------
-def generate_api_key(length: int = 32) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.choices(alphabet, k=length))
-
-
-def generate_alias(length: int = 6) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.choices(alphabet, k=length))
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 # ---------- Authentication ----------
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")  # required for admin actions
+API_KEYS = {key.strip() for key in os.getenv("API_KEYS", "").split(",") if key.strip()}
 
 
-def require_admin(x_api_key: str = Header(..., alias="X-API-Key")):
-    if ADMIN_API_KEY is None:
+def get_api_key(x_api_key: Optional[str] = Header(None)):
+    if not x_api_key or x_api_key not in API_KEYS:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server misconfiguration: ADMIN_API_KEY not set",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
         )
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin API key")
     return x_api_key
 
 
-def get_caller_key(
-    x_api_key: str = Header(..., alias="X-API-Key")
-) -> Dict:
-    key_record = api_keys_by_key.get(x_api_key)
-    if not key_record:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
-    return key_record
+# ---------- In-memory storage ----------
+# store[api_key][bookmark_id] = BookmarkData
+store: Dict[str, Dict[uuid.UUID, "BookmarkData"]] = {}
 
 
 # ---------- Pydantic models ----------
-class CreateKeyRequest(BaseModel):
-    owner: Optional[str] = None
-    quota: Optional[int] = Field(
-        default=None, ge=1, description="Optional daily request quota for the key."
+class BookmarkCreateRequest(BaseModel):
+    url: HttpUrl = Field(..., description="The URL to bookmark")
+    title: Optional[str] = Field(
+        None, max_length=255, description="Optional human-readable title"
     )
 
 
-class CreateKeyResponse(BaseModel):
-    id: str = Field(..., description="UUID of the key")
-    key: str = Field(..., description="Plain API key (only shown once).")
-    owner: Optional[str] = None
-    quota: Optional[int] = None
-    created_at: str = Field(..., description="ISO‑8601 timestamp")
+class BookmarkResponse(BaseModel):
+    id: uuid.UUID
+    url: HttpUrl
+    title: Optional[str] = None
+    created_at: datetime
 
 
-class CreateLinkRequest(BaseModel):
-    target_url: HttpUrl = Field(..., description="Destination URL.")
-    alias: Optional[str] = Field(
-        default=None,
-        pattern="^[A-Za-z0-9]{6,}$",
-        description="Optional custom alias.",
-    )
-    expires_at: Optional[datetime] = Field(
-        default=None, description="Optional expiration timestamp."
-    )
-
-    @validator("expires_at", pre=True)
-    def parse_expires(cls, v):
-        if v is None:
-            return v
-        if isinstance(v, str):
-            return datetime.fromisoformat(v)
-        return v
+class ListBookmarksResponse(BaseModel):
+    items: List[BookmarkResponse]
+    nextPage: Optional[str] = None
 
 
-class CreateLinkResponse(BaseModel):
-    id: str
-    alias: str
-    target_url: HttpUrl
-    owner_key_id: str
-    created_at: str
-    expires_at: Optional[str] = None
-    click_count: int = 0
+class BookmarkData(BaseModel):
+    id: uuid.UUID
+    url: HttpUrl
+    title: Optional[str] = None
+    created_at: datetime
 
 
-class StatsResponse(BaseModel):
-    total_clicks: int
-    daily: List[Dict] = Field(default_factory=list)
-    user_agents: List[Dict] = Field(default_factory=list)
-    referrers: List[Dict] = Field(default_factory=list)
+# ---------- Helper ----------
+def get_user_store(api_key: str) -> Dict[uuid.UUID, BookmarkData]:
+    if api_key not in store:
+        store[api_key] = {}
+    return store[api_key]
 
 
 # ---------- Endpoints ----------
-@app.get("/health")
+@app.get("/health", response_model=dict, status_code=200)
 def health():
+    """Health check required by the generic spec (no auth)."""
     return {"status": "ok"}
 
 
-@app.post("/keys", response_model=CreateKeyResponse, status_code=201)
-def create_key(
-    payload: CreateKeyRequest,
-    _: str = Depends(require_admin),
+@app.get("/healthz", response_model=dict, status_code=200)
+def healthz():
+    """Health check defined in the contract (no auth)."""
+    return {"status": "ok"}
+
+
+@app.post(
+    "/bookmarks",
+    response_model=BookmarkResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(get_api_key)],
+)
+def create_bookmark(
+    payload: BookmarkCreateRequest, api_key: str = Depends(get_api_key)
 ):
-    key_id = str(uuid.uuid4())
-    plain_key = generate_api_key()
-    record = {
-        "id": key_id,
-        "key": plain_key,
-        "owner": payload.owner,
-        "quota": payload.quota,
-        "created_at": now_iso(),
-    }
-    api_keys_by_id[key_id] = record
-    api_keys_by_key[plain_key] = record
-    return CreateKeyResponse(
-        id=key_id,
-        key=plain_key,
-        owner=payload.owner,
-        quota=payload.quota,
-        created_at=record["created_at"],
+    bookmark_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    bookmark = BookmarkData(
+        id=bookmark_id,
+        url=payload.url,
+        title=payload.title,
+        created_at=now,
     )
+    user_store = get_user_store(api_key)
+    user_store[bookmark_id] = bookmark
+    return BookmarkResponse(**bookmark.dict())
 
 
-@app.delete("/keys/{id}", status_code=204)
-def delete_key(
-    id: str,
-    _: str = Depends(require_admin),
+@app.get(
+    "/bookmarks",
+    response_model=ListBookmarksResponse,
+    status_code=200,
+    dependencies=[Depends(get_api_key)],
+)
+def list_bookmarks(
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    size: int = Query(20, ge=1, le=100, description="Number of items per page"),
+    api_key: str = Depends(get_api_key),
 ):
-    key_record = api_keys_by_id.pop(id, None)
-    if not key_record:
-        raise HTTPException(status_code=404, detail="Key not found")
-    api_keys_by_key.pop(key_record["key"], None)
-    return JSONResponse(status_code=204, content=None)
-
-
-@app.post("/links", response_model=CreateLinkResponse, status_code=201)
-def create_link(
-    payload: CreateLinkRequest,
-    caller: Dict = Depends(get_caller_key),
-):
-    # Resolve alias
-    alias = payload.alias
-    if alias:
-        if alias in links_by_alias:
-            raise HTTPException(status_code=400, detail="Alias already in use")
-    else:
-        # generate unique alias
-        for _ in range(10):
-            alias = generate_alias()
-            if alias not in links_by_alias:
-                break
-        else:
-            raise HTTPException(status_code=500, detail="Failed to generate unique alias")
-
-    link_id = str(uuid.uuid4())
-    created_at = now_iso()
-    expires_at_iso = payload.expires_at.isoformat() if payload.expires_at else None
-
-    link_record = {
-        "id": link_id,
-        "alias": alias,
-        "target_url": str(payload.target_url),
-        "owner_key_id": caller["id"],
-        "created_at": created_at,
-        "expires_at": expires_at_iso,
-        "click_count": 0,
-        # simple stats placeholders
-        "daily": [],
-        "user_agents": [],
-        "referrers": [],
-    }
-
-    links_by_id[link_id] = link_record
-    links_by_alias[alias] = link_record
-
-    return CreateLinkResponse(
-        id=link_id,
-        alias=alias,
-        target_url=payload.target_url,
-        owner_key_id=caller["id"],
-        created_at=created_at,
-        expires_at=expires_at_iso,
-        click_count=0,
+    user_store = get_user_store(api_key)
+    # newest first
+    sorted_bookmarks = sorted(
+        user_store.values(), key=lambda b: b.created_at, reverse=True
     )
+    start = (page - 1) * size
+    end = start + size
+    slice_ = sorted_bookmarks[start:end]
+    items = [BookmarkResponse(**b.dict()) for b in slice_]
+
+    next_page = None
+    if end < len(sorted_bookmarks):
+        next_page = str(page + 1)  # simple opaque token
+
+    return ListBookmarksResponse(items=items, nextPage=next_page)
 
 
-@app.get("/links/{id}/stats", response_model=StatsResponse)
-def get_link_stats(
-    id: str,
-    _: Dict = Depends(get_caller_key),
-):
-    link = links_by_id.get(id)
-    if not link:
-        raise HTTPException(status_code=404, detail="Link not found")
-    return StatsResponse(
-        total_clicks=link["click_count"],
-        daily=link.get("daily", []),
-        user_agents=link.get("user_agents", []),
-        referrers=link.get("referrers", []),
-    )
+@app.get(
+    "/bookmarks/{id}",
+    response_model=BookmarkResponse,
+    status_code=200,
+    dependencies=[Depends(get_api_key)],
+)
+def get_bookmark(id: uuid.UUID, api_key: str = Depends(get_api_key)):
+    user_store = get_user_store(api_key)
+    bookmark = user_store.get(id)
+    if not bookmark:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    return BookmarkResponse(**bookmark.dict())
 
 
-@app.get("/{alias}", status_code=301)
-def redirect_alias(alias: str):
-    link = links_by_alias.get(alias)
-    if not link:
-        raise HTTPException(status_code=404, detail="Alias not found")
-    # Optional expiration handling
-    if link["expires_at"]:
-        expires = datetime.fromisoformat(link["expires_at"])
-        if expires < datetime.now(timezone.utc):
-            raise HTTPException(status_code=410, detail="Link has expired")
-    # Increment click count
-    link["click_count"] += 1
-    return RedirectResponse(url=link["target_url"], status_code=301)
+@app.delete(
+    "/bookmarks/{id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(get_api_key)],
+)
+def delete_bookmark(id: uuid.UUID, api_key: str = Depends(get_api_key)):
+    user_store = get_user_store(api_key)
+    if id not in user_store:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    del user_store[id]
+    return None
