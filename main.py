@@ -1,151 +1,210 @@
 import os
 import uuid
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import List, Optional, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from pydantic import BaseModel, Field, HttpUrl
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Path, status
+from pydantic import BaseModel, EmailStr, Field, validator, ConfigDict
 
 app = FastAPI()
 
 
+# ---------- In-memory storage ----------
+# Each contact is stored as a dict matching the response schema.
+_contacts: dict[str, dict] = {}
+
+
 # ---------- Authentication ----------
-API_KEYS = {key.strip() for key in os.getenv("API_KEYS", "").split(",") if key.strip()}
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "changeme")  # simple shared secret
 
 
-def get_api_key(x_api_key: Optional[str] = Header(None)):
-    if not x_api_key or x_api_key not in API_KEYS:
+def verify_token(authorization: Optional[str] = Header(None)):
+    """
+    Simple Bearer token authentication.
+    Expected header: Authorization: Bearer <TOKEN>
+    """
+    if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
+            detail="Missing Authorization header",
         )
-    return x_api_key
-
-
-# ---------- In-memory storage ----------
-# store[api_key][bookmark_id] = BookmarkData
-store: Dict[str, Dict[uuid.UUID, "BookmarkData"]] = {}
+    try:
+        scheme, token = authorization.split()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authorization header format",
+        )
+    if scheme.lower() != "bearer" or token != AUTH_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    return True
 
 
 # ---------- Pydantic models ----------
-class BookmarkCreateRequest(BaseModel):
-    url: HttpUrl = Field(..., description="The URL to bookmark")
-    title: Optional[str] = Field(
-        None, max_length=255, description="Optional human-readable title"
-    )
+class ContactBase(BaseModel):
+    name: Optional[str] = Field(None, min_length=1)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+
+    @validator("phone")
+    def phone_pattern(cls, v):
+        if v is None:
+            return v
+        pattern = re.compile(r"^[+]?\\d{7,15}$")
+        if not pattern.fullmatch(v):
+            raise ValueError("Phone number must match pattern ^[+]?\\d{7,15}$")
+        return v
 
 
-class BookmarkResponse(BaseModel):
-    id: uuid.UUID
-    url: HttpUrl
-    title: Optional[str] = None
-    created_at: datetime
+class ContactCreate(ContactBase):
+    name: str = Field(..., min_length=1)
+    email: EmailStr = ...
+    phone: str = ...
+
+    model_config = ConfigDict(extra="forbid")
 
 
-class ListBookmarksResponse(BaseModel):
-    items: List[BookmarkResponse]
-    nextPage: Optional[str] = None
+class ContactUpdate(ContactBase):
+    model_config = ConfigDict(extra="forbid")
 
 
-class BookmarkData(BaseModel):
-    id: uuid.UUID
-    url: HttpUrl
-    title: Optional[str] = None
-    created_at: datetime
+class ContactResponse(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    phone: str
+    created_at: str
+    updated_at: str
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-# ---------- Helper ----------
-def get_user_store(api_key: str) -> Dict[uuid.UUID, BookmarkData]:
-    if api_key not in store:
-        store[api_key] = {}
-    return store[api_key]
+class ContactsListResponse(BaseModel):
+    contacts: List[ContactResponse]
+    total: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+    timestamp: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Helper functions ----------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_contact_or_404(contact_id: str) -> dict:
+    contact = _contacts.get(contact_id)
+    if not contact or contact.get("deleted"):
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return contact
 
 
 # ---------- Endpoints ----------
-@app.get("/health", response_model=dict, status_code=200)
-def health():
-    """Health check required by the generic spec (no auth)."""
-    return {"status": "ok"}
-
-
-@app.get("/healthz", response_model=dict, status_code=200)
-def healthz():
-    """Health check defined in the contract (no auth)."""
-    return {"status": "ok"}
-
-
 @app.post(
-    "/bookmarks",
-    response_model=BookmarkResponse,
+    "/api/v1/contacts",
+    response_model=ContactResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(get_api_key)],
+    dependencies=[Depends(verify_token)],
 )
-def create_bookmark(
-    payload: BookmarkCreateRequest, api_key: str = Depends(get_api_key)
-):
-    bookmark_id = uuid.uuid4()
-    now = datetime.now(timezone.utc)
-    bookmark = BookmarkData(
-        id=bookmark_id,
-        url=payload.url,
-        title=payload.title,
-        created_at=now,
-    )
-    user_store = get_user_store(api_key)
-    user_store[bookmark_id] = bookmark
-    return BookmarkResponse(**bookmark.dict())
+def create_contact(payload: ContactCreate):
+    contact_id = str(uuid.uuid4())
+    timestamp = now_iso()
+    contact = {
+        "id": contact_id,
+        "name": payload.name,
+        "email": payload.email,
+        "phone": payload.phone,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "deleted": False,
+    }
+    _contacts[contact_id] = contact
+    return ContactResponse(**contact)
 
 
 @app.get(
-    "/bookmarks",
-    response_model=ListBookmarksResponse,
-    status_code=200,
-    dependencies=[Depends(get_api_key)],
+    "/api/v1/contacts",
+    response_model=ContactsListResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_token)],
 )
-def list_bookmarks(
-    page: int = Query(1, ge=1, description="Page number (1-based)"),
-    size: int = Query(20, ge=1, le=100, description="Number of items per page"),
-    api_key: str = Depends(get_api_key),
+def list_contacts(
+    limit: int = Query(100, ge=1),
+    offset: int = Query(0, ge=0),
 ):
-    user_store = get_user_store(api_key)
-    # newest first
-    sorted_bookmarks = sorted(
-        user_store.values(), key=lambda b: b.created_at, reverse=True
+    all_contacts = [c for c in _contacts.values() if not c.get("deleted")]
+    total = len(all_contacts)
+    sliced = all_contacts[offset : offset + limit]
+    return ContactsListResponse(
+        contacts=[ContactResponse(**c) for c in sliced],
+        total=total,
     )
-    start = (page - 1) * size
-    end = start + size
-    slice_ = sorted_bookmarks[start:end]
-    items = [BookmarkResponse(**b.dict()) for b in slice_]
-
-    next_page = None
-    if end < len(sorted_bookmarks):
-        next_page = str(page + 1)  # simple opaque token
-
-    return ListBookmarksResponse(items=items, nextPage=next_page)
 
 
 @app.get(
-    "/bookmarks/{id}",
-    response_model=BookmarkResponse,
-    status_code=200,
-    dependencies=[Depends(get_api_key)],
+    "/api/v1/contacts/{contact_id}",
+    response_model=ContactResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_token)],
 )
-def get_bookmark(id: uuid.UUID, api_key: str = Depends(get_api_key)):
-    user_store = get_user_store(api_key)
-    bookmark = user_store.get(id)
-    if not bookmark:
-        raise HTTPException(status_code=404, detail="Bookmark not found")
-    return BookmarkResponse(**bookmark.dict())
+def get_contact(contact_id: str = Path(..., regex=r"^[0-9a-fA-F-]{36}$")):
+    contact = get_contact_or_404(contact_id)
+    return ContactResponse(**contact)
+
+
+@app.put(
+    "/api/v1/contacts/{contact_id}",
+    response_model=ContactResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_token)],
+)
+def update_contact(
+    payload: ContactUpdate,
+    contact_id: str = Path(..., regex=r"^[0-9a-fA-F-]{36}$"),
+):
+    contact = get_contact_or_404(contact_id)
+
+    # Update mutable fields if provided
+    if payload.name is not None:
+        contact["name"] = payload.name
+    if payload.email is not None:
+        contact["email"] = payload.email
+    if payload.phone is not None:
+        contact["phone"] = payload.phone
+
+    contact["updated_at"] = now_iso()
+    _contacts[contact_id] = contact
+    return ContactResponse(**contact)
 
 
 @app.delete(
-    "/bookmarks/{id}",
+    "/api/v1/contacts/{contact_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(get_api_key)],
+    dependencies=[Depends(verify_token)],
 )
-def delete_bookmark(id: uuid.UUID, api_key: str = Depends(get_api_key)):
-    user_store = get_user_store(api_key)
-    if id not in user_store:
-        raise HTTPException(status_code=404, detail="Bookmark not found")
-    del user_store[id]
-    return None
+def delete_contact(contact_id: str = Path(..., regex=r"^[0-9a-fA-F-]{36}$")):
+    contact = get_contact_or_404(contact_id)
+    # Soft delete: mark as deleted
+    contact["deleted"] = True
+    contact["updated_at"] = now_iso()
+    _contacts[contact_id] = contact
+    return None  # FastAPI will produce an empty response body
+
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    status_code=status.HTTP_200_OK,
+)
+def health_check():
+    return HealthResponse(status="ok", timestamp=now_iso())
