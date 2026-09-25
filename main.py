@@ -1,151 +1,101 @@
-import os
-import uuid
+from fastapi import FastAPI, HTTPException, Query, Path, Response
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field, UUID4
+from typing import List, Literal
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from pydantic import BaseModel, Field, HttpUrl
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
 
+# In-memory storage for notes
+_notes: dict[UUID, dict] = {}
 
-# ---------- Authentication ----------
-API_KEYS = {key.strip() for key in os.getenv("API_KEYS", "").split(",") if key.strip()}
+# Prometheus metric
+notes_created_counter = Counter(
+    "notes_created_total",
+    "Total number of notes created"
+)
 
+# ---------- Schemas ----------
+class NoteCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    content: str = Field(..., min_length=1, max_length=5000)
 
-def get_api_key(x_api_key: Optional[str] = Header(None)):
-    if not x_api_key or x_api_key not in API_KEYS:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
-        )
-    return x_api_key
+class NoteResponse(BaseModel):
+    id: UUID4
+    title: str = Field(..., max_length=255)
+    content: str = Field(..., max_length=5000)
+    createdAt: datetime
 
-
-# ---------- In-memory storage ----------
-# store[api_key][bookmark_id] = BookmarkData
-store: Dict[str, Dict[uuid.UUID, "BookmarkData"]] = {}
-
-
-# ---------- Pydantic models ----------
-class BookmarkCreateRequest(BaseModel):
-    url: HttpUrl = Field(..., description="The URL to bookmark")
-    title: Optional[str] = Field(
-        None, max_length=255, description="Optional human-readable title"
-    )
-
-
-class BookmarkResponse(BaseModel):
-    id: uuid.UUID
-    url: HttpUrl
-    title: Optional[str] = None
-    created_at: datetime
-
-
-class ListBookmarksResponse(BaseModel):
-    items: List[BookmarkResponse]
-    nextPage: Optional[str] = None
-
-
-class BookmarkData(BaseModel):
-    id: uuid.UUID
-    url: HttpUrl
-    title: Optional[str] = None
-    created_at: datetime
-
-
-# ---------- Helper ----------
-def get_user_store(api_key: str) -> Dict[uuid.UUID, BookmarkData]:
-    if api_key not in store:
-        store[api_key] = {}
-    return store[api_key]
-
+class HealthResponse(BaseModel):
+    status: Literal["UP"] = Field(..., example="UP")
 
 # ---------- Endpoints ----------
-@app.get("/health", response_model=dict, status_code=200)
-def health():
-    """Health check required by the generic spec (no auth)."""
-    return {"status": "ok"}
-
-
-@app.get("/healthz", response_model=dict, status_code=200)
-def healthz():
-    """Health check defined in the contract (no auth)."""
-    return {"status": "ok"}
-
-
 @app.post(
-    "/bookmarks",
-    response_model=BookmarkResponse,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(get_api_key)],
+    "/api/v1/notes",
+    response_model=NoteResponse,
+    status_code=201,
+    summary="Create a new note"
 )
-def create_bookmark(
-    payload: BookmarkCreateRequest, api_key: str = Depends(get_api_key)
-):
-    bookmark_id = uuid.uuid4()
+def create_note(payload: NoteCreateRequest):
+    note_id = UUID4(uuid4())
     now = datetime.now(timezone.utc)
-    bookmark = BookmarkData(
-        id=bookmark_id,
-        url=payload.url,
-        title=payload.title,
-        created_at=now,
-    )
-    user_store = get_user_store(api_key)
-    user_store[bookmark_id] = bookmark
-    return BookmarkResponse(**bookmark.dict())
-
+    note = {
+        "id": note_id,
+        "title": payload.title,
+        "content": payload.content,
+        "createdAt": now,
+    }
+    _notes[note_id] = note
+    notes_created_counter.inc()
+    return note
 
 @app.get(
-    "/bookmarks",
-    response_model=ListBookmarksResponse,
+    "/api/v1/notes",
+    response_model=List[NoteResponse],
     status_code=200,
-    dependencies=[Depends(get_api_key)],
+    summary="List notes with pagination (sorted by createdAt descending)"
 )
-def list_bookmarks(
-    page: int = Query(1, ge=1, description="Page number (1-based)"),
-    size: int = Query(20, ge=1, le=100, description="Number of items per page"),
-    api_key: str = Depends(get_api_key),
+def list_notes(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0)
 ):
-    user_store = get_user_store(api_key)
-    # newest first
-    sorted_bookmarks = sorted(
-        user_store.values(), key=lambda b: b.created_at, reverse=True
+    sorted_notes = sorted(
+        _notes.values(),
+        key=lambda n: n["createdAt"],
+        reverse=True
     )
-    start = (page - 1) * size
-    end = start + size
-    slice_ = sorted_bookmarks[start:end]
-    items = [BookmarkResponse(**b.dict()) for b in slice_]
-
-    next_page = None
-    if end < len(sorted_bookmarks):
-        next_page = str(page + 1)  # simple opaque token
-
-    return ListBookmarksResponse(items=items, nextPage=next_page)
-
+    return sorted_notes[offset: offset + limit]
 
 @app.get(
-    "/bookmarks/{id}",
-    response_model=BookmarkResponse,
+    "/api/v1/notes/{id}",
+    response_model=NoteResponse,
     status_code=200,
-    dependencies=[Depends(get_api_key)],
+    summary="Retrieve a single note by its UUID"
 )
-def get_bookmark(id: uuid.UUID, api_key: str = Depends(get_api_key)):
-    user_store = get_user_store(api_key)
-    bookmark = user_store.get(id)
-    if not bookmark:
-        raise HTTPException(status_code=404, detail="Bookmark not found")
-    return BookmarkResponse(**bookmark.dict())
+def get_note(id: UUID4 = Path(...)):
+    note = _notes.get(id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return note
 
-
-@app.delete(
-    "/bookmarks/{id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(get_api_key)],
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    status_code=200,
+    summary="Liveness probe for CI/CD pipelines"
 )
-def delete_bookmark(id: uuid.UUID, api_key: str = Depends(get_api_key)):
-    user_store = get_user_store(api_key)
-    if id not in user_store:
-        raise HTTPException(status_code=404, detail="Bookmark not found")
-    del user_store[id]
-    return None
+def health():
+    return {"status": "UP"}
+
+@app.get(
+    "/metrics",
+    status_code=200,
+    summary="Prometheus metrics endpoint",
+    response_class=PlainTextResponse
+)
+def metrics():
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
